@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: telegram-vps-rdp-bot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: ADMIN_USERNAME
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: WEBHOOK_URL
+        sync: false
+      - key: CONFHOME_MIRROR_PATH
+        value: /reinstall-mirror
+      - key: RDP_REQUIRE_PUBLIC_3389
+        value: "true"
+      - key: RDP_POST_READY_SOAK_MS
+        value: "90000"
+      - key: RDP_FINAL_VALIDATE_ATTEMPTS
+        value: "18"
+      - key: RDP_FINAL_STABLE_REQUIRED
+        value: "3"
+      - key: NODE_ENV
+        value: production
