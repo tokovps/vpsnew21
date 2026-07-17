@@ -67,12 +67,11 @@
 //   now also resolves the BEST available checksum for the exact chosen file
 //   (priority: a published companion SHA256 file > archive.org's own
 //   automatic SHA1 fixity value > MD5 > CRC32 as last resort), and
-//   `precheckOnVps` adds a dedicated `iso_checksum` gate that streams the
-//   full ISO through the matching `*sum` tool ON THE VPS and hard-fails
-//   (no reinstall dispatch) on any mismatch. If a collection genuinely
-//   publishes no checksum at all, the gate is recorded as SKIPPED (never as
-//   PASSED) so this is always visible in logs/reports rather than silently
-//   assumed-good.
+//   `precheckOnVps` can run a dedicated full-file `iso_checksum` gate when
+//   RDP_PREFLIGHT_FULL_ISO_CHECKSUM=true. Production fast mode keeps the
+//   metadata/URL/size/disk checks but skips the duplicate 4–6 GB download;
+//   that skip is recorded explicitly in logs rather than silently treated
+//   as a successful byte-for-byte verification.
 // ================================================================
 const https = require('https');
 const http = require('http');
@@ -82,6 +81,25 @@ const { REINSTALL_SCRIPT_URL } = require('./rdpConfig');
 // Overridable only for testing / an operator-run archive.org mirror.
 // Defaults to the real Internet Archive for all production behaviour.
 const ARCHIVE_ORG_BASE = (process.env.ARCHIVE_ORG_BASE || 'https://archive.org').replace(/\/+$/, '');
+
+// Fast mode is the production default. The upstream flow downloads the ISO
+// after reboot from Alpine, so downloading the same 4–6 GB file here merely
+// to hash it doubles transfer time and can keep an order in pre-reboot for
+// 45+ minutes. Strict operators can opt back into the redundant full-file
+// verification with RDP_PREFLIGHT_FULL_ISO_CHECKSUM=true.
+const PREFLIGHT_FULL_ISO_CHECKSUM = /^(1|true|yes|on)$/i.test(
+  String(process.env.RDP_PREFLIGHT_FULL_ISO_CHECKSUM || 'false').trim()
+);
+const PREFLIGHT_ISO_SPEED_TEST = !/^(0|false|no|off)$/i.test(
+  String(process.env.RDP_ISO_SPEED_PROBE || 'true').trim()
+);
+const parsedSpeedMbps = Number(process.env.RDP_ISO_MIN_DOWNLOAD_MBPS || 40);
+const ISO_MIN_DOWNLOAD_MBPS = Number.isFinite(parsedSpeedMbps) && parsedSpeedMbps > 0
+  ? parsedSpeedMbps : 40;
+const parsedProbeBytes = Number(process.env.RDP_ISO_SPEED_PROBE_BYTES || 8 * 1024 * 1024);
+const ISO_SPEED_PROBE_BYTES = Number.isFinite(parsedProbeBytes)
+  ? Math.max(2 * 1024 * 1024, Math.min(32 * 1024 * 1024, Math.floor(parsedProbeBytes)))
+  : 8 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────────
 // SUPPORTED WINDOWS MATRIX (curated, updated in-bot on each release)
@@ -656,12 +674,9 @@ async function precheckOnVps(host, credentials, target, { debug } = {}) {
       },
     },
     {
-      // ROUND-11: threshold now accounts for the FULL ISO being written to
-      // disk (see iso_checksum below) instead of only being streamed and
-      // discarded. Uses the resolved size when known (+2 GB safety margin
-      // for the eventual reinstall.sh/Alpine stage's own scratch usage),
-      // falling back to a size that comfortably covers the largest image
-      // in WINDOWS_MATRIX (~5.9 GB) when the size wasn't resolvable.
+      // Keep a size-aware disk gate even in fast mode. The Ubuntu preflight
+      // no longer caches the full ISO by default, but the Alpine/Windows
+      // installer still needs sufficient target disk and scratch space.
       name: 'disk_space',
       cmd: `df -BM --output=avail / | tail -1 | tr -d ' M'`,
       validate: (r) => {
@@ -674,7 +689,50 @@ async function precheckOnVps(host, credentials, target, { debug } = {}) {
     },
   ];
 
-  // ═══ ROUND-11 — single-download-to-disk + integrity gate ════════════
+  // A reachable ISO can still be far too slow for the requested activation
+  // time. Download only the first few MiB and measure sustained throughput.
+  // `head` closes the pipe at ISO_SPEED_PROBE_BYTES, so this never becomes a
+  // second full-ISO download. Slow routes are retryable on another provider.
+  if (!PREFLIGHT_FULL_ISO_CHECKSUM && PREFLIGHT_ISO_SPEED_TEST) {
+    const diskIndex = checks.findIndex((check) => check.name === 'disk_space');
+    const minimumBps = Math.ceil(ISO_MIN_DOWNLOAD_MBPS * 1000 * 1000 / 8);
+    const speedCheck = {
+      name: 'iso_throughput',
+      cmd:
+        `tmp=/tmp/.rdp-iso-speed-$$; ` +
+        `start=$(date +%s%3N); ` +
+        `curl -fsSL --max-time 20 "${target.isoUrl}" 2>/dev/null | head -c ${ISO_SPEED_PROBE_BYTES} > "$tmp"; ` +
+        `end=$(date +%s%3N); got=$(wc -c < "$tmp" 2>/dev/null || echo 0); ` +
+        `elapsed=$((end-start)); [ "$elapsed" -gt 0 ] || elapsed=1; ` +
+        `bps=$((got*1000/elapsed)); rm -f "$tmp"; ` +
+        `echo "__ISO_SPEED__=$got:$elapsed:$bps"`,
+      validate: (r) => {
+        const match = (r.stdout || '').match(/__ISO_SPEED__=(\d+):(\d+):(\d+)/);
+        if (!match) return { ok: false, detail: 'Tes kecepatan ISO tidak menghasilkan data yang valid.' };
+        const got = Number(match[1]);
+        const bps = Number(match[3]);
+        const mbps = bps * 8 / 1000 / 1000;
+        const estimatedMin = target.sizeBytes && bps > 0
+          ? Math.ceil(target.sizeBytes / bps / 60)
+          : null;
+        if (got < 2 * 1024 * 1024 || bps < minimumBps) {
+          return {
+            ok: false,
+            detail: `Rute ISO terlalu lambat (${mbps.toFixed(1)} Mbps; minimum ${ISO_MIN_DOWNLOAD_MBPS} Mbps` +
+              `${estimatedMin ? `; estimasi download ${estimatedMin} menit` : ''}). Mencoba provider lain.`,
+          };
+        }
+        return {
+          ok: true,
+          detail: `${mbps.toFixed(1)} Mbps` +
+            `${estimatedMin ? ` · estimasi download ISO ${estimatedMin} menit` : ''}`,
+        };
+      },
+    };
+    checks.splice(diskIndex < 0 ? checks.length : diskIndex, 0, speedCheck);
+  }
+
+  // ═══ OPTIONAL STRICT MODE — full-download integrity gate ════════════
   // ROUND-10 streamed the whole ISO through `curl | shasum` and discarded
   // the bytes (no disk write) — the checksum was trusted, but nothing on
   // disk was ever proven to actually match it, and a second full fetch
@@ -707,7 +765,8 @@ async function precheckOnVps(host, credentials, target, { debug } = {}) {
   // than just cost bandwidth. Left as a follow-up requiring test infra.
   const LOCAL_ISO_CACHE_DIR = '/root/.reinstall-iso-cache';
   let localIsoPath = null;
-  if (target.checksum && target.checksum.value && target.checksum.type) {
+  if (PREFLIGHT_FULL_ISO_CHECKSUM
+      && target.checksum && target.checksum.value && target.checksum.type) {
     const algoCmdMap = { sha256: 'sha256sum', sha1: 'sha1sum', md5: 'md5sum', crc32: 'cksum' };
     const algoCmd = algoCmdMap[target.checksum.type];
     const wantHex = String(target.checksum.value).trim().toLowerCase();
@@ -784,20 +843,27 @@ async function precheckOnVps(host, credentials, target, { debug } = {}) {
         throw err;
       }
     }
-    // If no checksum could be resolved for this target at all, the gate
-    // never ran above — record that explicitly as SKIPPED (never as a
-    // silent PASS) so reports always show whether integrity was actually
-    // verified.
+    // If strict verification is disabled (the default fast path), do not
+    // download the same multi-gigabyte ISO twice. We still resolve the
+    // source's checksum metadata and perform URL/size/disk gates above, but
+    // record the full-file hash as explicitly SKIPPED rather than pretending
+    // it ran. Setting RDP_PREFLIGHT_FULL_ISO_CHECKSUM=true restores the old
+    // pre-download + hash behaviour.
     if (!checks.some((c) => c.name === 'iso_checksum')) {
+      const checksumKnown = !!(target.checksum && target.checksum.value && target.checksum.type);
       results.push({
         name: 'iso_checksum',
         ok: true,
         skipped: true,
-        detail: 'Dilewati — sumber tidak mempublikasikan checksum apapun (sha256/sha1/md5/crc32) untuk file ini.',
+        detail: checksumKnown
+          ? `Fast mode — full ISO tidak diunduh dua kali pada Ubuntu. Metadata ${target.checksum.type} tersedia dari ${target.checksum.source}; verifikasi penuh dapat diaktifkan dengan RDP_PREFLIGHT_FULL_ISO_CHECKSUM=true.`
+          : 'Dilewati — sumber tidak mempublikasikan checksum apapun (sha256/sha1/md5/crc32) untuk file ini.',
         exitCode: null,
       });
-      dbg.warn('PRECHECK', 'iso_checksum: SKIPPED (no checksum published by source)', {
-        isoUrl: target.isoUrl,
+      dbg.info('PRECHECK', checksumKnown
+        ? 'iso_checksum: SKIPPED (fast mode avoids duplicate 4–6 GB download)'
+        : 'iso_checksum: SKIPPED (no checksum published by source)', {
+        isoUrl: target.isoUrl, checksumKnown, fastMode: !PREFLIGHT_FULL_ISO_CHECKSUM,
       });
     }
     // localIsoPath is only meaningful for logs/audit right now — see the
@@ -842,4 +908,8 @@ module.exports = {
   detectLanguagesPresent,
   extractChecksum,
   ARCHIVE_ORG_BASE,
+  PREFLIGHT_FULL_ISO_CHECKSUM,
+  PREFLIGHT_ISO_SPEED_TEST,
+  ISO_MIN_DOWNLOAD_MBPS,
+  ISO_SPEED_PROBE_BYTES,
 };

@@ -9,9 +9,8 @@
 //   • Progress % is monotonically non-decreasing per order. If the code ever
 //     tries to move backwards (bug in orchestrator), the renderer clamps to
 //     the previous max.
-//   • ETA is a lookup — NOT derived from elapsed time. When state doesn't
-//     change for a while, ETA stays put; the animated spinner is the only
-//     thing that changes, purely to signal liveness.
+//   • ETA duration comes from this lookup. The progress renderer converts it
+//     to an absolute per-phase deadline and displays a real countdown.
 //   • Each state carries a fixed checklist bitmap: which checks are ✅ when
 //     the state is reached. This prevents "Generate Password ✅" appearing
 //     before the generated credential is ready to be released.
@@ -33,20 +32,22 @@ const CHECK_KEYS = [
 // State table. Every state must have: label, pct, etaMin, checks[], phase.
 // `checks` = list of check keys that turn ✅ upon reaching this state.
 // pct is the guaranteed progress when we enter this state.
-// etaMin = estimated MINUTES REMAINING once we enter this state (upper bound).
+// etaMin = estimated upper bound for THIS PHASE. It intentionally resets
+// only when the lifecycle advances, so users can see whether the current
+// step (SSH, staging, reboot, install, validation) is taking abnormally long.
 const STATES = {
-  QUEUED:              { label: 'Masuk Antrian',                pct:  2, etaMin: 40, checks: [] },
-  PROVIDER_SELECTING:  { label: 'Memilih Provider Terbaik',      pct:  5, etaMin: 40, checks: [] },
-  PROVIDER_LOCKED:     { label: 'Mengunci Provider',             pct:  8, etaMin: 39, checks: [] },
-  VPS_CREATING:        { label: 'Membuat VPS Linux',             pct: 15, etaMin: 38, checks: [] },
-  VPS_READY:           { label: 'VPS Linux Siap',                pct: 22, etaMin: 35, checks: ['vps_ready'] },
-  SSH_CONNECTING:      { label: 'Menghubungkan SSH',             pct: 25, etaMin: 34, checks: ['vps_ready'] },
-  SSH_READY:           { label: 'SSH Connected',                 pct: 30, etaMin: 33, checks: ['vps_ready', 'ssh_ready'] },
-  REINSTALL_STARTING:  { label: 'Menjalankan Script Reinstall',  pct: 35, etaMin: 32, checks: ['vps_ready', 'ssh_ready', 'reinstall_started'] },
-  LINUX_REBOOTING:     { label: 'VPS Reboot ke Installer',       pct: 42, etaMin: 30, checks: ['vps_ready', 'ssh_ready', 'reinstall_started'] },
-  WINDOWS_INSTALLING:  { label: 'Menginstall Windows',           pct: 60, etaMin: 20, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting'] },
-  WINDOWS_BOOTING:     { label: 'Windows Booting',               pct: 80, etaMin:  6, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting'] },
-  RDP_CONFIGURING:     { label: 'Konfigurasi RDP',               pct: 86, etaMin:  4, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting', 'rdp_configured'] },
+  QUEUED:              { label: 'Masuk Antrian',                pct:  2, etaMin:  2, checks: [] },
+  PROVIDER_SELECTING:  { label: 'Memilih Provider Terbaik',      pct:  5, etaMin:  2, checks: [] },
+  PROVIDER_LOCKED:     { label: 'Mengunci Provider',             pct:  8, etaMin:  1, checks: [] },
+  VPS_CREATING:        { label: 'Membuat VPS Linux',             pct: 15, etaMin:  3, checks: [] },
+  VPS_READY:           { label: 'VPS Linux Siap',                pct: 22, etaMin:  2, checks: ['vps_ready'] },
+  SSH_CONNECTING:      { label: 'Menghubungkan SSH',             pct: 25, etaMin:  4, checks: ['vps_ready'] },
+  SSH_READY:           { label: 'SSH Connected',                 pct: 30, etaMin:  2, checks: ['vps_ready', 'ssh_ready'] },
+  REINSTALL_STARTING:  { label: 'Menyiapkan Boot Installer',     pct: 35, etaMin:  4, checks: ['vps_ready', 'ssh_ready', 'reinstall_started'] },
+  LINUX_REBOOTING:     { label: 'VPS Reboot ke Installer',       pct: 42, etaMin:  3, checks: ['vps_ready', 'ssh_ready', 'reinstall_started'] },
+  WINDOWS_INSTALLING:  { label: 'Menginstall Windows',           pct: 60, etaMin: 15, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting'] },
+  WINDOWS_BOOTING:     { label: 'Windows Booting',               pct: 80, etaMin:  2, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting'] },
+  RDP_CONFIGURING:     { label: 'Konfigurasi RDP',               pct: 86, etaMin:  2, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting', 'rdp_configured'] },
   RDP_VALIDATING:      { label: 'Validasi RDP',                  pct: 92, etaMin:  2, checks: ['vps_ready', 'ssh_ready', 'reinstall_started', 'windows_booting', 'rdp_configured'] },
   // Internal key retained for backward compatibility with persisted orders.
   // This phase does not pretend to perform a full Administrator credential

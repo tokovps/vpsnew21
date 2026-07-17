@@ -39,7 +39,7 @@ function testOrchestratorWiring() {
     'forceRebootStage',                                          // R7: escalation ladder (was forcedRebootTried)
     'FORCE_REBOOT',                                               // log tag
     'POWER_ON',                                                   // log tag
-    'RDP_REBOOT_HARD_LIMIT_MS',                                   // env override
+    'cfg.REBOOT_HARD_LIMIT_MS',                                   // central env-backed override
   ];
   for (const m of markers) {
     assert.ok(src.includes(m), `orchestrator missing marker: "${m}"`);

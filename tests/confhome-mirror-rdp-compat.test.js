@@ -125,7 +125,9 @@ for (const valueName of ['AllowEncryptionOracle', 'SecurityLayer', 'fDenyTSConne
 // i.e. count of "reg add" occurrences should not exceed count of comparison guards.
 const codeLines = batContent.split(/\r?\n/).filter((l) => !/^\s*rem\b/i.test(l));
 const regAddCount = codeLines.filter((l) => /^\s*reg add/i.test(l)).length;
-const guardCount = (batContent.match(/if \/i not/g) || []).length;
+// Count only registry audit comparisons. The script also has lifecycle guards
+// for the persistent watchdog, which are unrelated to `reg add` safety.
+const guardCount = codeLines.filter((l) => /^\s*if \/i not .*_CUR%/i.test(l)).length;
 assert.strictEqual(regAddCount, guardCount, 'every reg add must be gated by a prior audit comparison');
 assert.ok(batContent.includes('del "%~f0"'), 'script should clean up after itself like the other generated bats');
 console.log('✅ 5. windows-fix-rdp-compat.bat audits every registry value before writing (idempotent)');

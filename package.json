@@ -7,7 +7,7 @@
     "start": "node src/app.js",
     "dev": "nodemon src/app.js",
     "lint": "eslint -c eslintrc.json src/**/*.js",
-    "test:rdp": "node tests/rdp-ready-detection-round11.test.js && node tests/rdp-hardening-round16.test.js && node tests/confhome-mirror-rdp-compat.test.js && node tests/rdp-stage-tracker-round14.test.js"
+    "test:rdp": "node tests/rdp-ready-detection-round11.test.js && node tests/rdp-hardening-round16.test.js && node tests/confhome-mirror-rdp-compat.test.js && node tests/rdp-stage-tracker-round14.test.js && node tests/rdp-speed-round17.test.js && node tests/rdp-speed-round18.test.js && node tests/rdp-liveness-round19.test.js"
   },
   "engines": {
     "node": ">=18.0.0"

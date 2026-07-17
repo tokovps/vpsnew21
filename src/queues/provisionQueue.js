@@ -38,11 +38,11 @@ function readConcurrency(name, fallback) {
   return Number.isInteger(value) && value >= 1 && value <= 5 ? value : fallback;
 }
 
-// Defaults intentionally total four concurrent jobs: two fast VPS creates and
-// two long-running Windows RDP installs can progress independently. Operators
+// Defaults intentionally allow two fast VPS creates and three network-bound
+// Windows RDP installs to progress independently. Operators
 // may tune each lane without touching code.
 const vpsProvisionQueue = new Queue(readConcurrency('VPS_PROVISION_CONCURRENCY', 2));
-const rdpProvisionQueue = new Queue(readConcurrency('RDP_PROVISION_CONCURRENCY', 2));
+const rdpProvisionQueue = new Queue(readConcurrency('RDP_PROVISION_CONCURRENCY', 3));
 
 function getProvisionQueueStats() {
   const vps = vpsProvisionQueue.stats();

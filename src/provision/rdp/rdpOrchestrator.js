@@ -40,6 +40,7 @@ const { createRdpDebugLogger } = require('./rdpDebugLogger');
 const cfg = require('./rdpConfig');
 const winInstaller = require('./windowsInstaller');
 const { createStageTracker } = require('./rdpStageTracker');
+const { isPermanentProviderFailure } = require('../../services/providerFailureClassifier');
 
 const log = (...args) => console.log('[rdp-orch]', ...args);
 
@@ -186,6 +187,7 @@ async function runOnce(bot, order, progress, debug, stages) {
 
     const attemptStart = Date.now();
     let created = null;
+    let providerCapacityCommitted = false;
     const adapter = providers.get(locked.provider);
 
     try {
@@ -334,7 +336,7 @@ async function runOnce(bot, order, progress, debug, stages) {
 
       // A guest-level Windows firewall rule cannot override a DigitalOcean
       // Cloud Firewall. Audit every firewall attached directly or through the
-      // `tgbot` tag before spending up to 90 minutes on the reinstall. This
+      // `tgbot` tag before spending up to 20 minutes on the reinstall. This
       // specifically prevents the bot from certifying an endpoint that only
       // its own source IP can reach while the customer remains blocked.
       if (cfg.RDP_REQUIRE_PUBLIC_3389 && String(locked.provider).toLowerCase() === 'digitalocean') {
@@ -395,6 +397,23 @@ async function runOnce(bot, order, progress, debug, stages) {
         localIsoPath: precheck.localIsoPath || null,
       });
 
+      // The provider token is needed exclusively only until the Droplet has
+      // been created and the preflight has passed. Commit one quota slot now
+      // and release the API record back to READY while Windows installs.
+      // This lets other paid orders start immediately instead of waiting up
+      // to the full Windows installation time behind a single token lock.
+      const capacity = await providerService.markUsed(locked._id);
+      if (!capacity) {
+        const e = new Error('Gagal mencatat pemakaian quota provider setelah Droplet dibuat.');
+        e.code = 'PROVIDER_CAPACITY_COMMIT_FAILED';
+        throw e;
+      }
+      providerCapacityCommitted = true;
+      debug.info('PROVIDER_RELEASED', 'Provider slot committed; API token released during Windows install', {
+        apiId: String(locked._id), remainingQuota: capacity.quotaAvailable,
+        nextStatus: capacity.status,
+      });
+
       const cmd = cfg.buildReinstallCommand({
         sub: 'windows',
         imageName: winTarget.imageName,
@@ -414,7 +433,9 @@ async function runOnce(bot, order, progress, debug, stages) {
       });
 
       await progress.setState('REINSTALL_STARTING');
-      progress.setSubStatus(`Target: ${winTarget.imageName}`);
+      progress.setSubStatus(
+        `Target: ${winTarget.imageName} • staging maksimal ${Math.round(cfg.REINSTALL_DISPATCH_TIMEOUT_MS / 60000)} menit`
+      );
       const reinstallStart = Date.now();
       let reinstallLog = '';
       stages.enter(1, `bash reinstall.sh windows --image-name "${winTarget.imageName}"`);
@@ -472,7 +493,9 @@ async function runOnce(bot, order, progress, debug, stages) {
         // Derive a SPECIFIC user-visible reason from the log tail.
         const combined = (stdoutTail + '\n' + stderrTail).toLowerCase();
         let specific;
-        if (/iso link is empty|iso url is not set/.test(combined)) {
+        if (rr.exitCode === 124) {
+          specific = `Staging boot installer melewati batas ${Math.round(cfg.REINSTALL_DISPATCH_TIMEOUT_MS / 60000)} menit dan dihentikan otomatis.`;
+        } else if (/iso link is empty|iso url is not set/.test(combined)) {
           specific = 'ISO Link kosong (script upstream tidak dapat menemukan ISO). Direct ISO URL harus di-set via ENV — cek konfigurasi.';
         } else if (/not support find this iso/.test(combined)) {
           specific = `--image-name "${winTarget.imageName}" tidak dikenal upstream reinstall.sh. Butuh update mapping WINDOWS_MATRIX di windowsInstaller.js.`;
@@ -487,13 +510,17 @@ async function runOnce(bot, order, progress, debug, stages) {
         } else {
           specific = `Script upstream error tidak dikenal (exit=${rr.exitCode}).`;
         }
-        throw new Error(
+        const reinstallErr = new Error(
           `Script reinstall GAGAL (exit=${rr.exitCode}) — ${specific}\n` +
           `[image-name] ${winTarget.imageName}\n` +
           `[iso-url]    ${winTarget.isoUrl}\n` +
           `[stdout tail]\n${stdoutTail}\n` +
           (stderrTail ? `[stderr tail]\n${stderrTail}` : '')
         );
+        reinstallErr.code = rr.exitCode === 124
+          ? 'RDP_REINSTALL_DISPATCH_TIMEOUT'
+          : 'RDP_REINSTALL_SCRIPT_FAILED';
+        throw reinstallErr;
       }
 
       // ═══ ROUND-6 MONITOR LOOP: multi-signal reboot detection ══════════
@@ -541,15 +568,17 @@ async function runOnce(bot, order, progress, debug, stages) {
       //   status=destroyed/gone                 → HARD FAIL immediately
       // ═══════════════════════════════════════════════════════════════════
       await progress.setState('LINUX_REBOOTING');
-      const bootDeadline    = Date.now() + cfg.REINSTALL_MAX_TIMEOUT_MS;
-      // ROUND-7 HARDENING: default 5→10 min supaya reboot yang lambat (DO
-      // droplet 4GB dgn Ubuntu cloud-init masih idle) tidak salah dianggap
-      // gagal. Force-reboot escalation (reboot → power_cycle → power_off+on)
-      // memberi 3× kesempatan REAL sebelum hard-fail.
-      const rebootHardLimit  = Number(process.env.RDP_REBOOT_HARD_LIMIT_MS || 10 * 60 * 1000);
-      const REBOOT_HARD_LIMIT_MS = rebootHardLimit;
+      // One total deadline starts at dispatch. Previously a brand-new
+      // long timeout window was started only AFTER runReinstall returned, so a
+      // hung staging command plus monitor loop could exceed an hour by a
+      // wide margin. Round-18 targets dispatch → externally reachable RDP
+      // within 20 minutes and rejects slow ISO routes during preflight.
+      const bootDeadline = reinstallStart + cfg.REINSTALL_MAX_TIMEOUT_MS;
+      const REBOOT_HARD_LIMIT_MS = cfg.REBOOT_HARD_LIMIT_MS;
+      const REBOOT_ESCALATION_GRACE_MS = cfg.REBOOT_ESCALATION_GRACE_MS;
       const REBOOT_WINDOW_SEC    = 300;  // "uptime < this" ⇒ recent boot
       let   rebootHardDeadline   = Date.now() + REBOOT_HARD_LIMIT_MS;
+      await progress.setDeadline(Math.min(bootDeadline, rebootHardDeadline));
       let linuxWentDown       = false;
       let windowsUp           = false;
       let pollTick            = 0;
@@ -561,7 +590,7 @@ async function runOnce(bot, order, progress, debug, stages) {
       // Escalation ladder: 0=none, 1=reboot, 2=power_cycle, 3=power_off+power_on
       let forceRebootStage    = 0;
       // ROUND-7: Alpine stuck detector — bila linuxWentDown=true tapi port 22
-      // masih terbuka > ALPINE_STUCK_TIMEOUT_MS (default 25 min), berarti Alpine
+      // masih terbuka > ALPINE_STUCK_TIMEOUT_MS (default 12 min), berarti Alpine
       // menggantung download ISO. Trigger power_cycle sekali.
       let alpineStuckAt       = 0;
       let alpineForcedCycled  = false;
@@ -739,12 +768,12 @@ async function runOnce(bot, order, progress, debug, stages) {
         }
 
         // ── HARD FAIL: reboot did not fire within RDP_REBOOT_HARD_LIMIT_MS ─
-        // ROUND-7 escalation ladder (3 tiers, each with 2 min grace):
+        // Escalation ladder (3 tiers, each with a 30-second default grace):
         //   Stage 1: adapter.rebootDroplet()   — soft ACPI reboot
         //   Stage 2: adapter.powerCycle()      — hard power cycle
         //   Stage 3: powerOff() + powerOn()    — brute-force off then on
-        // Only after Stage 3 fails do we hard-fail. Total: ~10 min hard-limit
-        // + 6 min escalation grace = ~16 min real deadline.
+        // Only after Stage 3 fails do we hard-fail. Defaults: ~3 minutes
+        // before escalation + ~90 seconds total grace.
         if (!linuxWentDown && Date.now() > rebootHardDeadline && forceRebootStage < 3) {
           forceRebootStage++;
           const elapsedMs = Date.now() - reinstallStart;
@@ -776,9 +805,13 @@ async function runOnce(bot, order, progress, debug, stages) {
           }
           debug.info('FORCE_REBOOT', `Stage ${forceRebootStage} (${stageName}) result`, stageResult);
           if (stageResult && (stageResult.ok || stageResult.note)) {
-            // Give this stage 2 min to produce reboot signal before escalating.
-            rebootHardDeadline = Date.now() + 2 * 60 * 1000;
-            progress.setSubStatus(`Force ${stageName} berhasil — menunggu reboot 2 menit...`);
+            // Short, configurable grace: provider power actions normally
+            // become visible within seconds. One minute avoids three extra
+            // two-minute waits on a bootstrap that is already broken.
+            rebootHardDeadline = Date.now() + REBOOT_ESCALATION_GRACE_MS;
+            progress.setSubStatus(
+              `Force ${stageName} berhasil — menunggu reboot ${Math.round(REBOOT_ESCALATION_GRACE_MS / 60000)} menit...`
+            );
           } else {
             // This stage's API call itself failed. Immediately try next stage on next tick.
             rebootHardDeadline = Date.now() + 5000;
@@ -796,7 +829,9 @@ async function runOnce(bot, order, progress, debug, stages) {
             apiRebootDetected, forceRebootStage, logTail: reinstallLog.slice(-500),
           });
           stages.fail(2, `no reboot signal in ${reinstallSec}s after 3-stage force-reboot escalation`);
-          throw new Error(reason);
+          const rebootErr = new Error(reason);
+          rebootErr.code = 'RDP_REBOOT_TIMEOUT';
+          throw rebootErr;
         }
 
         // ── ROUND-7 ALPINE STUCK DETECTOR ─────────────────────────────────
@@ -824,13 +859,14 @@ async function runOnce(bot, order, progress, debug, stages) {
 
         // ── Sub-status UI ─────────────────────────────────────────────────
         const elapsedMin = Math.floor((Date.now() - reinstallStart) / 60000);
+        const remainingMin = Math.max(0, Math.ceil((bootDeadline - Date.now()) / 60000));
         const ssh   = p22   ? '✅' : '❌';
         const rdp   = p3389 ? '✅' : '⏳';
         const provTag = instStatus ? `[${instStatus.status}]` : '';
         if (!linuxWentDown) {
-          progress.setSubStatus(`SSH:${ssh} 3389:${rdp} ${provTag} • Menunggu reboot • ${elapsedMin}m`);
+          progress.setSubStatus(`SSH:${ssh} 3389:${rdp} ${provTag} • Menunggu reboot • ${elapsedMin}m • batas ${remainingMin}m`);
         } else if (!p3389) {
-          progress.setSubStatus(`SSH:${ssh} 3389:${rdp} ${provTag} • Windows install (${elapsedMin}m / 25-40m normal)`);
+          progress.setSubStatus(`SSH:${ssh} 3389:${rdp} ${provTag} • Windows install ${elapsedMin}m • sisa batas ${remainingMin}m`);
         }
         await new Promise(r => setTimeout(r, cfg.PORT_POLL_INTERVAL_MS));
       }
@@ -849,7 +885,9 @@ async function runOnce(bot, order, progress, debug, stages) {
         } else {
           stages.fail(4, 'reboot happened but port 3389 never opened externally within the monitor window — SetupComplete or Machine Startup Script likely did not run');
         }
-        throw new Error(reason);
+        const installErr = new Error(reason);
+        installErr.code = linuxWentDown ? 'RDP_INSTALL_TIMEOUT' : 'RDP_REBOOT_TIMEOUT';
+        throw installErr;
       }
 
       // ---- RDP configuring / validating / login-test ----
@@ -988,6 +1026,7 @@ async function runOnce(bot, order, progress, debug, stages) {
         password: adminPassword,
         sshKeyName: '',
         status: 'running',
+        rdpLastReadyAt: new Date(),
         // LIFECYCLE MARKER: droplet ini sudah/sedang di-reinstall menjadi
         // Windows. TIDAK PERNAH boleh diperlakukan sebagai VPS Linux di masa
         // depan — walaupun VpsInstance ini di-delete, marker tetap tercatat
@@ -1016,7 +1055,13 @@ async function runOnce(bot, order, progress, debug, stages) {
         },
       });
 
-      await providerService.markUsed(locked._id);
+      // Normally committed immediately after the preflight so another order
+      // can use the same provider token in parallel. Keep a defensive guard
+      // for future alternate provisioning paths that might skip that point.
+      if (!providerCapacityCommitted) {
+        await providerService.markUsed(locked._id);
+        providerCapacityCommitted = true;
+      }
       await providerService.recordAttempt(locked._id, true, Date.now() - attemptStart);
       await audit.log('rdp.success', {
         refId: order._id,
@@ -1111,8 +1156,19 @@ async function runOnce(bot, order, progress, debug, stages) {
       try {
         if (created && adapter.cleanup) await adapter.cleanup(locked, created).catch(() => {});
       } catch (_) {}
-      await providerService.unlockApi(locked._id, { reason: 'rdp attempt failed' });
-      await providerService.markError(locked._id, err);
+      if (!providerCapacityCommitted) {
+        await providerService.unlockApi(locked._id, { reason: 'rdp attempt failed before capacity commit' });
+      }
+      // A Windows/ISO timeout is not an invalid provider credential. Only a
+      // permanent authentication/account failure should disable the shared
+      // token, especially now that other installs may use it concurrently.
+      if (isPermanentProviderFailure(err)) {
+        await providerService.markError(locked._id, err);
+      } else if (providerCapacityCommitted) {
+        // Cleanup removed the failed Droplet; refresh live quota immediately
+        // instead of under-counting stock until the five-minute health cron.
+        try { await require('../../health/providerHealth').checkOne(locked._id); } catch (_) {}
+      }
       await providerService.recordAttempt(locked._id, false, Date.now() - attemptStart);
       await Order.findByIdAndUpdate(order._id, {
         $inc: { provisionRetryCount: 1 },
@@ -1136,6 +1192,12 @@ async function runOnce(bot, order, progress, debug, stages) {
         // itself is bad (corrupted/truncated/swapped) — same source URL on
         // every provider, so retrying elsewhere would just repeat it.
         'PRECHECK_ISO_CHECKSUM',
+        // Phase timeouts are already bounded and diagnosed. Retrying the
+        // same paid order on multiple providers would multiply a 20-minute
+        // wait and usually hit the same source/install problem again.
+        'RDP_REINSTALL_DISPATCH_TIMEOUT',
+        'RDP_REBOOT_TIMEOUT',
+        'RDP_INSTALL_TIMEOUT',
         'PWD_POLICY',
         // Spec / size errors — no point retrying on another provider, same
         // order data will fail identically. Surface to user immediately.

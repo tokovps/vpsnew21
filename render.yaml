@@ -21,11 +21,47 @@ services:
         value: /reinstall-mirror
       - key: RDP_REQUIRE_PUBLIC_3389
         value: "true"
+      - key: RDP_PREFLIGHT_FULL_ISO_CHECKSUM
+        value: "false"
+      - key: RDP_ISO_SPEED_PROBE
+        value: "true"
+      - key: RDP_ISO_MIN_DOWNLOAD_MBPS
+        value: "40"
+      - key: RDP_ISO_SPEED_PROBE_BYTES
+        value: "8388608"
+      - key: RDP_REINSTALL_DISPATCH_TIMEOUT_MS
+        value: "240000"
+      - key: RDP_REINSTALL_MAX_TIMEOUT_MS
+        value: "1200000"
+      - key: RDP_REBOOT_HARD_LIMIT_MS
+        value: "180000"
+      - key: RDP_REBOOT_ESCALATION_GRACE_MS
+        value: "30000"
+      - key: RDP_ALPINE_STUCK_TIMEOUT_MS
+        value: "720000"
+      - key: RDP_PORT_POLL_INTERVAL_MS
+        value: "5000"
+      - key: RDP_VALIDATE_ATTEMPTS
+        value: "24"
+      - key: RDP_VALIDATE_INTERVAL_MS
+        value: "5000"
       - key: RDP_POST_READY_SOAK_MS
-        value: "90000"
+        value: "45000"
       - key: RDP_FINAL_VALIDATE_ATTEMPTS
-        value: "18"
+        value: "12"
       - key: RDP_FINAL_STABLE_REQUIRED
+        value: "3"
+      - key: RDP_MAX_PROVIDER_ATTEMPTS
+        value: "2"
+      - key: RDP_PROVISION_CONCURRENCY
+        value: "3"
+      - key: RDP_HEALTH_INTERVAL_MS
+        value: "120000"
+      - key: RDP_HEALTH_FAILURE_THRESHOLD
+        value: "2"
+      - key: RDP_REPAIR_COOLDOWN_MS
+        value: "300000"
+      - key: RDP_MAX_REPAIR_ATTEMPTS
         value: "3"
       - key: NODE_ENV
         value: production

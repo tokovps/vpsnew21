@@ -13,6 +13,11 @@
 const assert = require('assert');
 const { NodeSSH } = require('node-ssh');
 
+// ROUND-17 makes the non-duplicating fast path the production default.
+// This legacy suite intentionally exercises the optional strict full-file
+// checksum path, so opt in before windowsInstaller.js is loaded.
+process.env.RDP_PREFLIGHT_FULL_ISO_CHECKSUM = 'true';
+
 function withScriptedSSH(handlers, fn) {
   const orig = {
     connect: NodeSSH.prototype.connect,

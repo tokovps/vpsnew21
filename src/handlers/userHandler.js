@@ -132,8 +132,8 @@ Namun seluruh Provider sedang sibuk.
 Silakan tunggu hingga salah satu proses
 instalasi selesai.
 
-⏱ *Estimasi waktu tunggu:*
-20–45 Menit
+⏱ *Estimasi waktu tunggu untuk mulai:*
+1–3 Menit — order RDP diproses paralel
 
 Setelah proses selesai Anda dapat langsung
 melakukan pembelian.
@@ -150,7 +150,7 @@ Posisi Anda :
 Menunggu Slot
 
 Estimasi :
-20–45 Menit
+1–3 Menit untuk mulai
 ━━━━━━━━━━━━━━`;
   const kb = Markup.inlineKeyboard([
     [Markup.button.callback('🔄 Coba Lagi', `menu:${category}`)],

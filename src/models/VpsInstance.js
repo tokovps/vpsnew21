@@ -32,6 +32,12 @@ const vpsInstanceSchema = new mongoose.Schema({
   raw: { type: mongoose.Schema.Types.Mixed, default: {} },
   lastHealthAt: { type: Date, default: null },
   lastHealthStatus: { type: String, default: '' },
+  // RDP-specific public reachability watchdog. These counters are persisted
+  // so a Render restart cannot reset a failing endpoint back to "healthy".
+  rdpLastReadyAt: { type: Date, default: null },
+  rdpConsecutiveFailures: { type: Number, default: 0 },
+  rdpRepairAttempts: { type: Number, default: 0 },
+  rdpLastRepairAt: { type: Date, default: null },
   hostname: { type: String, default: '' },
 }, { timestamps: true });
 

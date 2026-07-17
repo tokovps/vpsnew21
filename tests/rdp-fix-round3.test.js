@@ -116,11 +116,11 @@ function testUnsupportedOsPreflight() {
 
 // ─── POTENSI D: Timeout 60 min ──────────────────────────────────────────
 function testTimeout() {
-  assert.strictEqual(cfg.REINSTALL_MAX_TIMEOUT_MS, 90 * 60 * 1000,
-    `REINSTALL_MAX_TIMEOUT_MS should be 90 min (R7 hardening); got ${cfg.REINSTALL_MAX_TIMEOUT_MS / 60000} min`);
+  assert.strictEqual(cfg.REINSTALL_MAX_TIMEOUT_MS, 20 * 60 * 1000,
+    `REINSTALL_MAX_TIMEOUT_MS should be 20 min (R18 target); got ${cfg.REINSTALL_MAX_TIMEOUT_MS / 60000} min`);
   // Stall timeout also bumped to accommodate slow first-boot Windows
   assert.ok(cfg.STALL_TIMEOUT_MS >= 15 * 60 * 1000);
-  console.log(`✅ FIX D: REINSTALL_MAX_TIMEOUT_MS = ${cfg.REINSTALL_MAX_TIMEOUT_MS / 60000} min (was 45)`);
+  console.log(`✅ FIX D/R18: REINSTALL_MAX_TIMEOUT_MS = ${cfg.REINSTALL_MAX_TIMEOUT_MS / 60000} min target`);
 }
 
 // ─── POTENSI E: buildReinstallCommand structural review ─────────────────

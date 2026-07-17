@@ -96,7 +96,7 @@ function createRdpProgress(bot, order) {
 ━━━━━━━━━━━━━━━━━━
 ${spinner} *${cur.label}*
 ${runtime.subStatus ? `_${runtime.subStatus}_\n` : ''}
-⏱ Estimasi: *${eta}*
+⏱ Estimasi tahap: *${eta}*
 
 ━━━━━━━━━━━━━━━━━━
 *Status:*
@@ -199,6 +199,15 @@ ${checklistLine(cur.checks, 'validation',        'Final Validation')}
         return;
       }
       const curr = runtime.current && runtime.current.state;
+      // Repeated evidence for the same lifecycle phase must not restart the
+      // ETA countdown. The monitor can confirm reboot through port, SSH and
+      // provider API in adjacent polls; persisting the same state for every
+      // signal previously moved finishBy forward each time.
+      if (curr === state) {
+        await pushEdit(true);
+        startTicker();
+        return;
+      }
       if (!sm.canAdvance(curr, state)) {
         console.warn(`[rdp-progress] REGRESSIVE state transition IGNORED: ${curr} → ${state}`);
         return;
@@ -207,6 +216,20 @@ ${checklistLine(cur.checks, 'validation',        'Final Validation')}
       runtime.subStatus = '';
       await pushEdit(true);
       startTicker();
+    },
+    /** Override only the ETA deadline, without changing phase/progress.
+     *  Used by the installer monitor so the UI counts down to the same hard
+     *  deadline enforced by the orchestrator instead of resetting per poll. */
+    async setDeadline(timestampMs) {
+      const value = Number(timestampMs);
+      if (!Number.isFinite(value) || value <= 0) return;
+      runtime.finishBy = value;
+      const date = new Date(value);
+      order.rdpFinishBy = date;
+      await Order.findByIdAndUpdate(order._id, {
+        $set: { rdpFinishBy: date },
+      }).catch((e) => console.warn('[rdp-progress] persist deadline failed:', e && e.message));
+      await pushEdit(true);
     },
     /** Purely informational sub-status text. Does NOT alter state/pct/ETA. */
     setSubStatus(text) {

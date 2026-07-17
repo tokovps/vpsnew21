@@ -59,6 +59,32 @@ const WINDOWS_IMAGE_MAP = {
 };
 const DEFAULT_WINDOWS = { sub: 'windows', imageName: 'Windows Server 2022 SERVERSTANDARD' };
 
+function readDurationMs(name, fallbackMs, minimumMs = 1000) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallbackMs;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= minimumMs ? parsed : fallbackMs;
+}
+
+const REINSTALL_DISPATCH_TIMEOUT_MS = readDurationMs(
+  'RDP_REINSTALL_DISPATCH_TIMEOUT_MS', 4 * 60 * 1000, 2 * 60 * 1000
+);
+const REINSTALL_MAX_TIMEOUT_MS = readDurationMs(
+  'RDP_REINSTALL_MAX_TIMEOUT_MS', 20 * 60 * 1000, 15 * 60 * 1000
+);
+const REBOOT_HARD_LIMIT_MS = readDurationMs(
+  'RDP_REBOOT_HARD_LIMIT_MS', 3 * 60 * 1000, 60 * 1000
+);
+const REBOOT_ESCALATION_GRACE_MS = readDurationMs(
+  'RDP_REBOOT_ESCALATION_GRACE_MS', 30 * 1000, 10 * 1000
+);
+const ALPINE_STUCK_TIMEOUT_MS = readDurationMs(
+  'RDP_ALPINE_STUCK_TIMEOUT_MS', 12 * 60 * 1000, 5 * 60 * 1000
+);
+const PORT_POLL_INTERVAL_MS = readDurationMs(
+  'RDP_PORT_POLL_INTERVAL_MS', 5 * 1000, 2 * 1000
+);
+
 // ─────────────────────────────────────────────────────────────────────────
 // AUTO-INSTALL SUPPORT MATRIX
 // Historical version of this gate rejected Server 2012 R2 / 2016 because
@@ -149,6 +175,12 @@ function buildReinstallCommand({ sub, imageName, password, rdpPort, username, is
   const safeUser = String(username || 'administrator').replace(/[^A-Za-z0-9_.-]/g, '') || 'administrator';
   const rdp = Number(rdpPort) || 3389;
   const lang = process.env.REINSTALL_LANG || 'en-us';
+  // The Ubuntu-side script only stages the Alpine installer. It should
+  // finish (or reboot the VPS) within a few minutes; the multi-gigabyte ISO
+  // download happens later inside Alpine. A bounded command prevents a
+  // broken upstream prompt/download from leaving the order frozen at 35%
+  // forever. Operators can still raise this for unusually slow providers.
+  const dispatchTimeoutSec = Math.ceil(REINSTALL_DISPATCH_TIMEOUT_MS / 1000);
   const iso = String(isoUrl || '').trim();
   if (!iso || !/^https?:\/\//i.test(iso)) {
     // Refuse to construct a command that will inevitably hit the ISO auto-search
@@ -180,9 +212,13 @@ function buildReinstallCommand({ sub, imageName, password, rdpPort, username, is
     `echo "[rdp] launching: bash reinstall.sh ${safeSub} --image-name '${safeImage}' --iso '<url>' --lang ${lang} --username ${safeUser} --rdp-port ${rdp} --password ***"`,
     // Actual invocation. --iso is now MANDATORY — bypasses upstream's
     // massgrave.dev scrape AND the interactive Direct Link prompt.
-    `printf '\\n\\n\\n\\n\\n' | bash /tmp/reinstall.sh ${safeSub} --image-name "${safeImage}" --iso "${safeIso}" --lang ${lang} --username ${safeUser} --rdp-port ${rdp} --password "${safePwd}" 2>&1`,
+    // `timeout` is part of coreutils on the Ubuntu bootstrap image. Keep a
+    // fallback for custom images that omit it, while using the watchdog on
+    // every normal deployment.
+    `if command -v timeout >/dev/null 2>&1; then printf '\\n\\n\\n\\n\\n' | timeout --foreground ${dispatchTimeoutSec}s bash /tmp/reinstall.sh ${safeSub} --image-name "${safeImage}" --iso "${safeIso}" --lang ${lang} --username ${safeUser} --rdp-port ${rdp} --password "${safePwd}" 2>&1; else printf '\\n\\n\\n\\n\\n' | bash /tmp/reinstall.sh ${safeSub} --image-name "${safeImage}" --iso "${safeIso}" --lang ${lang} --username ${safeUser} --rdp-port ${rdp} --password "${safePwd}" 2>&1; fi`,
     'RC=$?',
     'echo "[rdp] script exit=$RC"',
+    `if [ $RC -eq 124 ]; then echo "[rdp] REINSTALL DISPATCH TIMEOUT after ${dispatchTimeoutSec}s — aborting"; exit 124; fi`,
     // Fail-fast if the script errored. NO blind reboot fallback.
     'if [ $RC -ne 0 ]; then echo "[rdp] REINSTALL SCRIPT FAILED — aborting (no reboot)"; exit $RC; fi',
     'echo "[rdp] reinstall staged OK — box will reboot into Windows installer within ~30s"',
@@ -203,26 +239,34 @@ module.exports = {
   validateWindowsPassword,
 
   // --- Timings (all overridable via env, minutes → ms internally) ---
-  // ROUND-7 HARDENING (user report: "reboot tidak terjadi / Alpine stuck download ISO"):
-  //   • REINSTALL_MAX 60→90 min — Alpine ISO download di provider slow can eat 30+ min.
-  //   • Alpine stage sanity gate — jika Alpine SSH terlihat > 25 min tanpa transisi ke
+  // ROUND-18 20-MINUTE TARGET (user report: 55-minute cap is too long):
+  //   • REINSTALL_MAX is a TOTAL deadline measured from script dispatch,
+  //     not a fresh timer started only after the script returns.
+  //   • Ubuntu dispatch has its own 4-minute watchdog. The ISO download is
+  //     performed by Alpine, so Ubuntu staging should never run for an hour.
+  //   • Default dispatch-to-RDP cap is 20 minutes. Slow sources are rejected
+  //     by the ISO throughput preflight instead of occupying a worker for an hour.
+  //   • Alpine stage sanity gate — jika Alpine SSH terlihat > 12 min tanpa transisi ke
   //     Windows, orchestrator akan trigger power_cycle (lihat rdpOrchestrator).
   SSH_READY_TIMEOUT_MS:      Number(process.env.RDP_SSH_READY_TIMEOUT_MS      || 10 * 60 * 1000),  // 10 min
   SSH_CONNECT_TIMEOUT_MS:    Number(process.env.RDP_SSH_CONNECT_TIMEOUT_MS    || 30 * 1000),
-  REINSTALL_MAX_TIMEOUT_MS:  Number(process.env.RDP_REINSTALL_MAX_TIMEOUT_MS  || 90 * 60 * 1000),  // 90 min
-  ALPINE_STUCK_TIMEOUT_MS:   Number(process.env.RDP_ALPINE_STUCK_TIMEOUT_MS   || 25 * 60 * 1000),  // Alpine SSH open > 25 min ⇒ force power_cycle
+  REINSTALL_DISPATCH_TIMEOUT_MS,
+  REINSTALL_MAX_TIMEOUT_MS,  // total: dispatch → RDP port
+  REBOOT_HARD_LIMIT_MS,
+  REBOOT_ESCALATION_GRACE_MS,
+  ALPINE_STUCK_TIMEOUT_MS,
   STALL_TIMEOUT_MS:          Number(process.env.RDP_STALL_TIMEOUT_MS          || 20 * 60 * 1000),  // no-progress kill
-  PORT_POLL_INTERVAL_MS:     Number(process.env.RDP_PORT_POLL_INTERVAL_MS     || 10 * 1000),
+  PORT_POLL_INTERVAL_MS,
   PROGRESS_TICK_MS:          Number(process.env.RDP_PROGRESS_TICK_MS          || 6 * 1000),
   RDP_PORT:                  Number(process.env.RDP_PORT                      || 3389),
   // ROUND-11 FIX (Windows RDP readiness detection):
   //   Historical default (6 attempts × 10s = 60s) was too short — Windows
   //   Setup restart TermService setelah OOBE + policies apply → port 3389
   //   sempat open lalu close lagi. 6 attempts sering "berhasil" pada open
-  //   pertama padahal RDP belum siap. Sekarang default 60 attempts × 10s
-  //   = 10 menit, DAN wajib STABLE 3/3 berturut-turut.
-  RDP_VALIDATE_ATTEMPTS:     Number(process.env.RDP_VALIDATE_ATTEMPTS         || 60),
-  RDP_VALIDATE_INTERVAL_MS:  Number(process.env.RDP_VALIDATE_INTERVAL_MS      || 10 * 1000),
+  //   pertama padahal RDP belum siap. Round-18 memakai 24 attempts × 5s
+  //   = 2 menit, DAN wajib STABLE 3/3 berturut-turut.
+  RDP_VALIDATE_ATTEMPTS:     Number(process.env.RDP_VALIDATE_ATTEMPTS         || 24),
+  RDP_VALIDATE_INTERVAL_MS:  Number(process.env.RDP_VALIDATE_INTERVAL_MS      || 5 * 1000),
   // Berapa poll berturut-turut yang harus SEMUA lulus (port3389 open +
   // RDP_NEG_RSP valid + TLS handshake OK) sebelum kita anggap Windows READY.
   // Port 22 hanya telemetry karena Windows dapat menjalankan OpenSSH.
@@ -233,12 +277,12 @@ module.exports = {
   // post-OOBE/policy restart window, then run a second independent validation.
   // This prevents a listener that is only briefly available from releasing
   // credentials. Set to 0 only for controlled tests.
-  RDP_POST_READY_SOAK_MS:    Number(process.env.RDP_POST_READY_SOAK_MS        || 90 * 1000),
-  RDP_FINAL_VALIDATE_ATTEMPTS: Number(process.env.RDP_FINAL_VALIDATE_ATTEMPTS || 18),
+  RDP_POST_READY_SOAK_MS:    Number(process.env.RDP_POST_READY_SOAK_MS        || 45 * 1000),
+  RDP_FINAL_VALIDATE_ATTEMPTS: Number(process.env.RDP_FINAL_VALIDATE_ATTEMPTS || 12),
   RDP_FINAL_STABLE_REQUIRED: Number(process.env.RDP_FINAL_STABLE_REQUIRED     || 3),
   // For a retail RDP product, a source-restricted DO Cloud Firewall can let
   // the bot's probe pass while blocking the customer. Fail before installing
   // Windows unless an attached firewall publicly permits the configured port.
   RDP_REQUIRE_PUBLIC_3389: String(process.env.RDP_REQUIRE_PUBLIC_3389 || 'true').toLowerCase() !== 'false',
-  MAX_PROVIDER_ATTEMPTS:     Number(process.env.RDP_MAX_PROVIDER_ATTEMPTS     || 4),
+  MAX_PROVIDER_ATTEMPTS:     Number(process.env.RDP_MAX_PROVIDER_ATTEMPTS     || 2),
 };

@@ -43,6 +43,23 @@ rem ============================================================================
 set "LOG=%SystemDrive%\windows-fix-rdp-compat.log"
 echo [rdp-compat] start %DATE% %TIME% > "%LOG%"
 
+rem --- 0) Install a persistent repair watchdog --------------------------------
+rem SetupComplete can run before the final specialize/OOBE reboot. The old
+rem script deleted itself after that first successful run, so a late policy
+rem refresh or reboot could close RDP permanently after the bot had validated
+rem it. Keep a SYSTEM copy and repair the listener at every startup + every
+rem two minutes. The repair body below remains idempotent.
+set "RDP_REPAIR_DIR=%ProgramData%\TokoVPS"
+set "RDP_REPAIR_BAT=%RDP_REPAIR_DIR%\rdp-watchdog.bat"
+if /i not "%~1"=="/watchdog" (
+    if not exist "%RDP_REPAIR_DIR%" mkdir "%RDP_REPAIR_DIR%" >> "%LOG%" 2>&1
+    copy /y "%~f0" "%RDP_REPAIR_BAT%" >> "%LOG%" 2>&1
+    schtasks /create /tn "TokoVPS-RDP-Startup" /sc onstart /delay 0000:30 ^
+      /ru SYSTEM /rl HIGHEST /tr "cmd.exe /d /c %RDP_REPAIR_BAT% /watchdog" /f >> "%LOG%" 2>&1
+    schtasks /create /tn "TokoVPS-RDP-Watchdog" /sc minute /mo 2 ^
+      /ru SYSTEM /rl HIGHEST /tr "cmd.exe /d /c %RDP_REPAIR_BAT% /watchdog" /f >> "%LOG%" 2>&1
+)
+
 rem --- 1) CredSSP encryption oracle remediation --------------------------------
 set "CREDSSP_KEY=HKLM\SOFTWARE\Policies\Microsoft\Windows\CredSSP\Parameters"
 set "CREDSSP_VAL=AllowEncryptionOracle"
@@ -115,12 +132,28 @@ for %%P in (TCP UDP) do (
       protocol=%%P localport=%RDP_PORT% >> "%LOG%" 2>&1
 )
 
-rem --- 6) TermService must be automatic and running -----------------------------
+rem --- 6) Firewall + RDP services must survive late reboot/policy refresh -------
+sc config MpsSvc start= auto >> "%LOG%" 2>&1
+sc start MpsSvc >> "%LOG%" 2>&1
 sc config TermService start= auto >> "%LOG%" 2>&1
+sc failure TermService reset= 86400 actions= restart/5000/restart/5000/restart/5000 >> "%LOG%" 2>&1
+sc failureflag TermService 1 >> "%LOG%" 2>&1
 sc start TermService >> "%LOG%" 2>&1
 sc query TermService >> "%LOG%" 2>&1
 
+rem A service can report RUNNING while the RDP-Tcp listener is absent. If so,
+rem restart it once and prove that the configured port is listening locally.
+netstat -ano | findstr /r /c:":%RDP_PORT% .*LISTENING" >nul 2>&1
+if errorlevel 1 (
+    echo [rdp-compat] port %RDP_PORT% not LISTENING - restarting TermService >> "%LOG%"
+    sc stop TermService >> "%LOG%" 2>&1
+    timeout /t 3 /nobreak >nul 2>&1
+    sc start TermService >> "%LOG%" 2>&1
+    timeout /t 3 /nobreak >nul 2>&1
+)
+netstat -ano | findstr /r /c:":%RDP_PORT% .*LISTENING" >> "%LOG%" 2>&1
+
 echo [rdp-compat] done %DATE% %TIME% >> "%LOG%"
 
-del "%~f0"
+if /i not "%~1"=="/watchdog" del "%~f0"
 endlocal

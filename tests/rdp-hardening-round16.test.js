@@ -100,11 +100,15 @@ function testWindowsRepairScript() {
     'profile=any',
     'sc config TermService start= auto',
     'sc start TermService',
+    'TokoVPS-RDP-Startup',
+    'TokoVPS-RDP-Watchdog',
+    'sc failure TermService',
+    'netstat -ano',
   ]) {
     assert.ok(bat.includes(required), `missing Windows RDP repair action: ${required}`);
   }
   assert.ok(!bat.includes('TSUserEnabled'), 'do not write the obsolete/ambiguous TSUserEnabled value');
-  console.log('✅ Windows first-boot repair enables listener, actual port, firewall, and TermService');
+  console.log('✅ Windows repair persists across reboot and restores listener, firewall, and TermService');
 }
 
 function testOrchestratorHardGate() {
